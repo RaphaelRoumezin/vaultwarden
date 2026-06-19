@@ -160,6 +160,23 @@ function resendUserInvite (event) {
     }
 }
 
+function resetUser(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    const id = event.target.parentNode.dataset.vwUserUuid;
+    if (!id) {
+        alert("Required parameters not found!");
+        return false;
+    }
+    const confirmed = confirm(`Are you sure you want to reset this user? This will delete all their ciphers, folders and sends, clear their password, and their memberships will have to be reconfirmed. They will receive a new invitation email.`);
+    if (confirmed) {
+        _post(`${BASE_URL}/admin/users/${id}/reset`,
+            "User reset successfully",
+            "Error resetting user"
+        );
+    }
+}
+
 const ORG_TYPES = {
     "0": {
         "name": "Owner",
@@ -279,6 +296,9 @@ function initUserTable() {
     });
     document.querySelectorAll("button[vw-resend-user-invite]").forEach(btn => {
         btn.addEventListener("click", resendUserInvite);
+    });
+    document.querySelectorAll("button[vw-reset-user]").forEach(btn => {
+        btn.addEventListener("click", resetUser);
     });
 
     if (jdenticon) {

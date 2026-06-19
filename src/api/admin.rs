@@ -25,7 +25,8 @@ use crate::{
         ACTIVE_DB_TYPE, DbConn, DbConnType, backup_sqlite, get_sql_server_version,
         models::{
             Attachment, Cipher, Collection, Device, Event, EventType, Group, Invitation, Membership, MembershipId,
-            MembershipType, OrgPolicy, Organization, OrganizationId, SsoUser, TwoFactor, User, UserId,
+            MembershipType, MembershipStatus, OrgPolicy, Organization, OrganizationId, SsoUser, TwoFactor, User, UserId,
+            Send, Folder
         },
     },
     error::{Error, MapResult},
@@ -52,6 +53,7 @@ pub fn routes() -> Vec<Route> {
         admin_page_login,
         invite_user,
         logout,
+        reset_user,
         delete_user,
         delete_sso_user,
         deauth_user,
@@ -304,23 +306,23 @@ async fn get_user_or_404(user_id: &UserId, conn: &DbConn) -> ApiResult<User> {
     }
 }
 
+async fn generate_invite(user: &User, conn: &DbConn) -> EmptyResult {
+    if CONFIG.mail_enabled() {
+        let org_id: OrganizationId = if CONFIG.sso_enabled() {
+            FAKE_SSO_IDENTIFIER.into()
+        } else {
+            FAKE_ADMIN_UUID.into()
+        };
+        let member_id: MembershipId = FAKE_ADMIN_UUID.to_owned().into();
+        mail::send_invite(user, org_id, member_id, &CONFIG.invitation_org_name(), None).await
+    } else {
+        let invitation = Invitation::new(&user.email);
+        invitation.save(conn).await
+    }
+}
+
 #[post("/invite", format = "application/json", data = "<data>")]
 async fn invite_user(data: Json<InviteData>, _token: AdminToken, conn: DbConn) -> JsonResult {
-    async fn generate_invite(user: &User, conn: &DbConn) -> EmptyResult {
-        if CONFIG.mail_enabled() {
-            let org_id: OrganizationId = if CONFIG.sso_enabled() {
-                FAKE_SSO_IDENTIFIER.into()
-            } else {
-                FAKE_ADMIN_UUID.into()
-            };
-            let member_id: MembershipId = FAKE_ADMIN_UUID.to_owned().into();
-            mail::send_invite(user, org_id, member_id, &CONFIG.invitation_org_name(), None).await
-        } else {
-            let invitation = Invitation::new(&user.email);
-            invitation.save(conn).await
-        }
-    }
-
     let data: InviteData = data.into_inner();
     if User::find_by_mail(&data.email, &conn).await.is_some() {
         err_code!("User already exists", Status::Conflict.code)
@@ -404,6 +406,43 @@ async fn get_user_by_mail_json(mail: &str, _token: AdminToken, conn: DbConn) -> 
     } else {
         err_code!("User doesn't exist", Status::NotFound.code);
     }
+}
+
+#[post("/users/<user_id>/reset", format = "application/json")]
+async fn reset_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
+    let mut user = get_user_or_404(&user_id, &conn).await?;
+
+    // Clear password and reset security stamp to invalidate all sessions and tokens
+    user.password_hash = Vec::new();
+    user.reset_security_stamp(&conn).await?;
+    user.totp_recover = None;
+
+    let res = user.save(&conn).await;
+
+    // Deauth all user devices
+    nt.send_logout(&user, None, &conn).await;
+    Device::delete_all_by_user(&user.uuid, &conn).await?;
+
+    // Clear ciphers
+    Cipher::delete_all_by_user(&user.uuid, &conn).await?;
+
+    // Clear folders
+    // Note: folders become orphaned after user is reset, I don't know why. I'd prefer to keep them though
+    Folder::delete_all_by_user(&user.uuid, &conn).await?;
+
+    // Clear sends
+    Send::delete_all_by_user(&user.uuid, &conn).await?;
+
+    // Downgrade memberships to "invited" state
+    for mut membership in Membership::find_any_state_by_user(&user_id, &conn).await {
+        membership.status = MembershipStatus::Invited as i32;
+        membership.save(&conn).await?;
+    }
+
+    // Invite user back
+    generate_invite(&user, &conn).await.map_err(|e| e.with_code(Status::InternalServerError.code))?;
+
+    res
 }
 
 #[get("/users/<user_id>")]
