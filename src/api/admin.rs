@@ -427,7 +427,6 @@ async fn reset_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Notif
     Cipher::delete_all_by_user(&user.uuid, &conn).await?;
 
     // Clear folders
-    // Note: folders become orphaned after user is reset, I don't know why. I'd prefer to keep them though
     Folder::delete_all_by_user(&user.uuid, &conn).await?;
 
     // Clear sends
