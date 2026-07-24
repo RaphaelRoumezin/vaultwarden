@@ -215,6 +215,7 @@ impl Organization {
             "useKeyConnector": false, // Not supported
             "usePasswordManager": true,
             "useSecretsManager": false, // Not supported (Not AGPLv3 Licensed)
+            "useMyItems": true,
             "selfHost": true,
             "useApi": true,
             "hasPublicAndPrivateKeys": self.private_key.is_some() && self.public_key.is_some(),
@@ -495,6 +496,7 @@ impl Membership {
             "useActivateAutofillPolicy": false,
             "useAdminSponsoredFamilies": false,
             "useRiskInsights": false, // Not supported (Not AGPLv3 Licensed)
+            "useMyItems": true,
 
             "organizationUserId": self.uuid,
             "providerId": null,
@@ -1167,6 +1169,24 @@ impl Membership {
                 .ok()
         })
         .await
+    }
+
+    pub async fn create_default_user_collection(&self, conn: &DbConn) {
+        if OrgPolicy::find_by_org_and_type(&self.org_uuid, OrgPolicyType::PersonalOwnership, conn)
+            .await
+            .is_some_and(|policy| policy.enabled)
+            && Collection::find_default_collection_by_organization_and_user_uuid(&org_id, &member.user_uuid, conn)
+                .await
+                .is_none()
+        {
+            let c = Collection::new(
+                org_id.clone(),
+                collection_name.to_string(),
+                None,
+                CollectionType::DefaultUserCollection as i32,
+            );
+            c.save(conn).await?;
+        }
     }
 }
 

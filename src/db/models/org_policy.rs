@@ -1,3 +1,4 @@
+use chrono::{NaiveDateTime, Utc};
 use derive_more::{AsRef, From};
 use diesel::prelude::*;
 use serde::Deserialize;
@@ -11,6 +12,7 @@ use crate::{
         schema::{org_policies, users_organizations},
     },
     error::MapResult,
+    util::format_date,
 };
 
 use super::{Membership, MembershipId, MembershipStatus, MembershipType, OrganizationId, TwoFactor, UserId};
@@ -24,6 +26,7 @@ pub struct OrgPolicy {
     pub atype: i32,
     pub enabled: bool,
     pub data: String,
+    pub revision_date: NaiveDateTime,
 }
 
 // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Enums/PolicyType.cs
@@ -70,12 +73,15 @@ pub struct ResetPasswordDataModel {
 /// Local methods
 impl OrgPolicy {
     pub fn new(org_uuid: OrganizationId, atype: OrgPolicyType, enabled: bool, data: String) -> Self {
+        let now = Utc::now().naive_utc();
+
         Self {
             uuid: OrgPolicyId(crate::util::get_uuid()),
             org_uuid,
             atype: atype as i32,
             enabled,
             data,
+            revision_date: now,
         }
     }
 
@@ -84,10 +90,22 @@ impl OrgPolicy {
     }
 
     pub fn to_json(&self) -> Value {
-        let data_json: Value = serde_json::from_str(&self.data).unwrap_or(Value::Null);
+        let mut data_json: Value = serde_json::from_str(&self.data).unwrap_or(Value::Null);
+
+        // In v2026.4.1, vault item transfer requires enableIndividualItemsTransfer to be set in data,
+        // But the Policies setting page does not set it. This is a hack to have this feature working.
+        // See https://github.com/bitwarden/clients/blob/web-v2026.4.1/libs/vault/src/services/default-vault-items-transfer.service.ts
+        // See https://github.com/bitwarden/clients/blob/web-v2026.4.1/apps/web/src/app/admin-console/organizations/policies/policy-edit-definitions/organization-data-ownership.component.ts
+        if self.atype == OrgPolicyType::PersonalOwnership as i32 && data_json.is_null() {
+            data_json = json!({
+                "enableIndividualItemsTransfer": true,
+            })
+        }
+
         let mut policy = json!({
             "id": self.uuid,
             "organizationId": self.org_uuid,
+            "revisionDate": format_date(&self.revision_date),
             "type": self.atype,
             "data": data_json,
             "enabled": self.enabled,
@@ -108,11 +126,13 @@ impl OrgPolicy {
 
 /// Database methods
 impl OrgPolicy {
-    pub async fn save(&self, conn: &DbConn) -> EmptyResult {
+    pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
+        self.revision_date = Utc::now().naive_utc();
+
         db_run! { conn:
             sqlite, mysql {
                 match diesel::replace_into(org_policies::table)
-                    .values(self)
+                    .values(&*self)
                     .execute(conn)
                 {
                     Ok(_) => Ok(()),
@@ -120,7 +140,7 @@ impl OrgPolicy {
                     Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::ForeignKeyViolation, _)) => {
                         diesel::update(org_policies::table)
                             .filter(org_policies::uuid.eq(&self.uuid))
-                            .set(self)
+                            .set(&*self)
                             .execute(conn)
                             .map_res("Error saving org_policy")
                     }

@@ -28,8 +28,17 @@ use super::{
 pub struct Collection {
     pub uuid: CollectionId,
     pub org_uuid: OrganizationId,
+    pub atype: i32,
     pub name: String,
     pub external_id: Option<String>,
+    pub default_user_collection_email: Option<String>,
+}
+
+// https://github.com/bitwarden/server/blob/0d603631188e45df2ed21feeb6bad241f9bd5d95/src/Core/AdminConsole/Enums/CollectionType.cs
+#[derive(Copy, Clone, Eq, PartialEq, num_derive::FromPrimitive)]
+pub enum CollectionType {
+    SharedCollection = 0,
+    DefaultUserCollection = 1,
 }
 
 #[derive(Identifiable, Queryable, Insertable)]
@@ -53,12 +62,14 @@ pub struct CollectionCipher {
 
 /// Local methods
 impl Collection {
-    pub fn new(org_uuid: OrganizationId, name: String, external_id: Option<String>) -> Self {
+    pub fn new(org_uuid: OrganizationId, name: String, external_id: Option<String>, atype: i32) -> Self {
         let mut new_model = Self {
             uuid: CollectionId(crate::util::get_uuid()),
             org_uuid,
+            atype,
             name,
             external_id: None,
+            default_user_collection_email: None,
         };
 
         new_model.set_external_id(external_id);
@@ -70,6 +81,7 @@ impl Collection {
             "externalId": self.external_id,
             "id": self.uuid,
             "organizationId": self.org_uuid,
+            "type": self.atype,
             "name": self.name,
             "object": "collection",
         })
@@ -310,6 +322,19 @@ impl Collection {
             .into_iter()
             .filter(|c| &c.org_uuid == org_uuid)
             .collect()
+    }
+
+    pub async fn find_default_collection_by_organization_and_user_uuid(
+        org_uuid: &OrganizationId,
+        user_uuid: &UserId,
+        conn: &DbConn,
+    ) -> Option<Self> {
+        Self::find_by_user_uuid(user_uuid.to_owned(), conn)
+            .await
+            .into_iter()
+            .filter(|c| c.atype == CollectionType::DefaultUserCollection as i32)
+            .filter(|c| &c.org_uuid == org_uuid)
+            .nth(0)
     }
 
     pub async fn find_by_organization(org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {

@@ -38,8 +38,10 @@ table! {
     collections (uuid) {
         uuid -> Text,
         org_uuid -> Text,
+        atype -> Integer,
         name -> Text,
         external_id -> Nullable<Text>,
+        default_user_collection_email -> Nullable<Text>,
     }
 }
 
@@ -116,6 +118,7 @@ table! {
         atype -> Integer,
         enabled -> Bool,
         data -> Text,
+        revision_date -> Timestamp,
     }
 }
 

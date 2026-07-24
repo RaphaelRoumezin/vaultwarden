@@ -6,18 +6,19 @@ use serde_json::Value;
 
 use crate::{
     CONFIG,
-    api::admin::FAKE_ADMIN_UUID,
     api::{
         EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
+        admin::FAKE_ADMIN_UUID,
         core::{CipherSyncData, CipherSyncType, accept_org_invite, log_event, two_factor},
     },
     auth::{AdminHeaders, Headers, ManagerHeaders, ManagerHeadersLoose, OrgMemberHeaders, OwnerHeaders, decode_invite},
     db::{
         DbConn,
         models::{
-            Cipher, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId, CollectionUser, EventType,
-            Group, GroupId, GroupUser, Invitation, Membership, MembershipId, MembershipStatus, MembershipType,
-            OrgPolicy, OrgPolicyType, Organization, OrganizationApiKey, OrganizationId, User, UserId,
+            Cipher, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId, CollectionType,
+            CollectionUser, EventType, Group, GroupId, GroupUser, Invitation, Membership, MembershipId,
+            MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization, OrganizationApiKey,
+            OrganizationId, User, UserId,
         },
     },
     mail,
@@ -211,7 +212,8 @@ async fn create_organization(headers: Headers, data: Json<OrgData>, conn: DbConn
 
     let org = Organization::new(data.name, &data.billing_email, private_key, public_key);
     let mut member = Membership::new(headers.user.uuid, org.uuid.clone(), None);
-    let collection = Collection::new(org.uuid.clone(), data.collection_name, None);
+    let collection =
+        Collection::new(org.uuid.clone(), data.collection_name, None, CollectionType::SharedCollection as i32);
 
     member.akey = data.key;
     member.access_all = true;
@@ -510,7 +512,8 @@ async fn post_organization_collections(
         err!("You don't have permission to create collections")
     }
 
-    let collection = Collection::new(org_id.clone(), data.name, data.external_id);
+    let collection =
+        Collection::new(org_id.clone(), data.name, data.external_id, CollectionType::SharedCollection as i32);
     collection.save(&conn).await?;
 
     log_event(
@@ -1832,7 +1835,8 @@ async fn post_org_import(
             if headers.membership.atype <= MembershipType::Manager && !headers.membership.has_full_access() {
                 err!(Compact, "The current user isn't allowed to create new collections")
             }
-            let new_collection = Collection::new(org_id.clone(), col.name, col.external_id);
+            let new_collection =
+                Collection::new(org_id.clone(), col.name, col.external_id, CollectionType::SharedCollection as i32);
             new_collection.save(&conn).await?;
             new_collection.uuid
         };
@@ -2037,6 +2041,7 @@ struct PolicyData {
 #[derive(Deserialize)]
 struct PutPolicy {
     policy: PolicyData,
+    metadata: Option<Value>,
     // Ignore metadata for now as we do not yet support this
     // "metadata": {
     //     "defaultUserCollectionName": "2.xx|xx==|xx="
@@ -2054,7 +2059,7 @@ async fn put_policy(
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    let data: PolicyData = data.into_inner().policy;
+    let data: PutPolicy = data.into_inner();
 
     let Some(pol_type_enum) = OrgPolicyType::from_i32(pol_type) else {
         err!("Invalid or unsupported policy type")
@@ -2066,7 +2071,7 @@ async fn put_policy(
     // We put this behind a config option to prevent breaking current installation.
     // Maybe we want to enable this by default in the future, but currently it is disabled by default.
     if CONFIG.enforce_single_org_with_reset_pw_policy() {
-        if pol_type_enum == OrgPolicyType::ResetPassword && data.enabled {
+        if pol_type_enum == OrgPolicyType::ResetPassword && data.policy.enabled {
             let single_org_policy_enabled =
                 match OrgPolicy::find_by_org_and_type(&org_id, OrgPolicyType::SingleOrg, &conn).await {
                     Some(p) => p.enabled,
@@ -2079,7 +2084,7 @@ async fn put_policy(
         }
 
         // Also prevent the Single Org Policy to be disabled if the Reset Password policy is enabled
-        if pol_type_enum == OrgPolicyType::SingleOrg && !data.enabled {
+        if pol_type_enum == OrgPolicyType::SingleOrg && !data.policy.enabled {
             let reset_pw_policy_enabled =
                 match OrgPolicy::find_by_org_and_type(&org_id, OrgPolicyType::ResetPassword, &conn).await {
                     Some(p) => p.enabled,
@@ -2093,7 +2098,7 @@ async fn put_policy(
     }
 
     // When enabling the TwoFactorAuthentication policy, revoke all members that do not have 2FA
-    if pol_type_enum == OrgPolicyType::TwoFactorAuthentication && data.enabled {
+    if pol_type_enum == OrgPolicyType::TwoFactorAuthentication && data.policy.enabled {
         two_factor::enforce_2fa_policy_for_org(
             &org_id,
             &headers.user.uuid,
@@ -2105,7 +2110,7 @@ async fn put_policy(
     }
 
     // When enabling the SingleOrg policy, remove this org's members that are members of other orgs
-    if pol_type_enum == OrgPolicyType::SingleOrg && data.enabled {
+    if pol_type_enum == OrgPolicyType::SingleOrg && data.policy.enabled {
         for mut member in Membership::find_by_org(&org_id, &conn).await {
             // Policy only applies to non-Owner/non-Admin members who have accepted joining the org
             // Exclude invited and revoked users when checking for this policy.
@@ -2139,13 +2144,35 @@ async fn put_policy(
         }
     }
 
+    // When enabling Organization Data Ownership policy, create user default collections
+    if pol_type_enum == OrgPolicyType::PersonalOwnership
+        && data.policy.enabled
+        && let Some(collection_name) =
+            data.metadata.as_ref().and_then(|m| m["defaultUserCollectionName"].as_str()).map(str::to_owned)
+    {
+        for member in Membership::find_confirmed_by_org(&org_id, &conn).await {
+            if Collection::find_default_collection_by_organization_and_user_uuid(&org_id, &member.user_uuid, &conn)
+                .await
+                .is_none()
+            {
+                let c = Collection::new(
+                    org_id.clone(),
+                    collection_name.to_string(),
+                    None,
+                    CollectionType::DefaultUserCollection as i32,
+                );
+                c.save(&conn).await?;
+            }
+        }
+    }
+
     let mut policy = match OrgPolicy::find_by_org_and_type(&org_id, pol_type_enum, &conn).await {
         Some(p) => p,
         None => OrgPolicy::new(org_id.clone(), pol_type_enum, false, "{}".to_owned()),
     };
 
-    policy.enabled = data.enabled;
-    policy.data = serde_json::to_string(&data.data)?;
+    policy.enabled = data.policy.enabled;
+    policy.data = serde_json::to_string(&data.policy.data)?;
     policy.save(&conn).await?;
 
     log_event(
